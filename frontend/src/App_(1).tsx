@@ -1,0 +1,935 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+
+
+// === THEME (professional / serious) ===
+const THEME_CSS = `:root{--bg:#F6F8FB;--surface:#fff;--sidebar-bg:#0B1F3A;--sidebar-text:#E5ECF5;--primary:#0B1F3A;--accent:#1E3A8A;--accent-contrast:#fff;--border:#D9DFE7;--text:#0B1220;--muted:#5B6473}
+.app{background:var(--bg);color:var(--text);min-height:100vh}
+.sidebar{background:var(--sidebar-bg);color:var(--sidebar-text);width:240px}
+.sidebar .brand{color:#fff;font-weight:700}
+.sidebar nav button{width:100%;text-align:left;padding:10px 12px;border-radius:10px;border:1px solid transparent;color:var(--sidebar-text);background:transparent}
+.sidebar nav button.active{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.12)}
+.sidebar nav button:hover{background:rgba(255,255,255,.06)}
+.header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:16px}
+.btn{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;cursor:pointer}
+.btn:hover{filter:brightness(.98)}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:var(--accent-contrast);border-color:var(--accent)}
+.btn-danger{background:#B42318;color:#fff;border-color:#B42318}
+.input{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 10px;min-width:240px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--border);background:#FAFBFD}
+.badge{padding:2px 8px;border-radius:999px;font-size:12px}
+.badge-online{background:#0E7C66;color:#fff}.badge-offline{background:#6B7280;color:#fff}
+.muted{color:var(--muted);font-size:12px}
+.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:10px;text-align:left}
+.thumb{width:64px;height:64px;border:1px solid var(--border);border-radius:8px;display:flex;align-items:center;justify-content:center;background:#F9FBFF;font-weight:700}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999}
+.modal{width:min(900px,92vw);max-height:88vh;overflow:auto}`;
+
+// --- Types ---
+export type Doc = {
+  id:number,
+  name:string,
+  filename:string,
+  category:string,
+  uploadedAt:string, // ISO
+  expiresAt?:string, // ISO
+  url?:string
+}
+
+type Address = { category:string, address:string }
+
+type Mode = 'offline' | 'online'
+
+type Tab = 'dashboard' | 'documente' | 'categorii' | 'cautare' | 'partajare' | 'inbox' | 'setari'
+
+type ShareLink = { id:string, items:{ docs:number[], categories:string[] }, url:string, expiresAt:string, password?:string }
+
+// --- Demo data (for Offline Demo Mode) ---
+const DEMO_USER = 'demo'
+const DEMO_CATEGORIES = ['facturi','contracte','hr','ssm'] as const
+const DEMO_INITIAL_CONTROL = '1'
+
+function makeAddress(cat:string, control:string, user:string){
+  return `${cat}.${control}.${user}@docs.ilegal.ro`
+}
+
+function daysAgo(n:number){ const d=new Date(); d.setDate(d.getDate()-n); return d }
+function daysFrom(n:number){ const d=new Date(); d.setDate(d.getDate()+n); return d }
+function iso(d:Date){ return d.toISOString() }
+
+function demoDocs(): Doc[]{
+  return [
+    { id: 1, name:'Contract de angajare', filename: 'contract-angajare.pdf', category: 'hr', uploadedAt: iso(daysAgo(12)), expiresAt: iso(daysFrom(365)) },
+    { id: 2, name:'Factura #1234', filename: 'factura_1234.pdf', category: 'facturi', uploadedAt: iso(daysAgo(4)), expiresAt: iso(daysFrom(180)) },
+    { id: 3, name:'Contract furnizor ACME', filename: 'contract-furnizor-ACME.pdf', category: 'contracte', uploadedAt: iso(daysAgo(40)), expiresAt: iso(daysFrom(200)) },
+    { id: 4, name:'Instructaj SSM inițial', filename: 'ssm-instructaj-initial.docx', category: 'ssm', uploadedAt: iso(daysAgo(2)), expiresAt: iso(daysFrom(365)) },
+  ]
+}
+
+function demoAddresses(control:string): Address[]{
+  return DEMO_CATEGORIES.map(cat => ({ category: cat, address: makeAddress(cat, control, DEMO_USER) }))
+}
+
+// --- Utils ---
+async function safeFetch(input: RequestInfo | URL, init?: RequestInit, timeoutMs = 5000): Promise<Response|null> {
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(input, { ...init, signal: controller.signal })
+    clearTimeout(t)
+    return res
+  } catch (_err){
+    clearTimeout(t)
+    return null
+  }
+}
+
+function addDays(d: Date, days: number){ const x = new Date(d); x.setDate(x.getDate()+days); return x }
+function fmtDate(isoStr?: string){ if(!isoStr) return '—'; const d = new Date(isoStr); return d.toLocaleString() }
+function randomId(){ return Math.random().toString(36).slice(2,10) }
+
+const DEFAULT_API = '' // empty by default to avoid auto-calling localhost in sandbox
+
+export function PreviewApp(){
+  const [apiUrl, setApiUrl] = useState<string>(DEFAULT_API)
+  const [mode, setMode] = useState<Mode>('offline')
+  const [offlineStrict, setOfflineStrict] = useState<boolean>(false)
+  const [error, setError] = useState<string>('')
+  const [active, setActive] = useState<Tab>('dashboard')
+
+  const [addresses, setAddresses] = useState<Address[]>(demoAddresses(DEMO_INITIAL_CONTROL))
+  const [docs, setDocs] = useState<Doc[]>(demoDocs())
+  const [busy, setBusy] = useState(false)
+
+  const [currentCategoryFilter, setCurrentCategoryFilter] = useState<string|undefined>(undefined)
+  const [selectedDocs, setSelectedDocs] = useState<Set<number>>(new Set())
+  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set())
+  const [previewDoc, setPreviewDoc] = useState<Doc|null>(null)
+
+  const [shares, setShares] = useState<ShareLink[]>([])
+
+  // simple id generator for offline uploads
+  const idSeq = useRef(1000)
+
+  // Try to connect to API and pull data; fall back to offline if unreachable
+  async function checkConnection(){
+    if(!apiUrl){
+      setMode('offline')
+      setError('Niciun API URL setat. Rulez în Offline Demo Mode.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const [aRes, dRes] = await Promise.all([
+        safeFetch(`${apiUrl}/me/magic-inbox/addresses`),
+        safeFetch(`${apiUrl}/documents/list`),
+      ])
+      if (!aRes || !dRes) throw new Error('Nu pot contacta API-ul (network).')
+      if (!aRes.ok || !dRes.ok) throw new Error(`API răspunde cu erori (addresses:${aRes.status}, docs:${dRes.status}).`)
+      const newAddresses: Address[] = await aRes.json()
+      const newDocs: Doc[] = await dRes.json()
+      setAddresses(newAddresses)
+      setDocs(newDocs)
+      setMode('online')
+      setError('')
+    } catch (e:any){
+      setMode('offline')
+      setError(e?.message || 'Conexiune eșuată. Rulez în Offline Demo Mode.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Start in offline mode with demo data (no network calls on mount)
+  useEffect(()=>{ setMode('offline') }, [])
+
+  // --- Derived ---
+  const categories = useMemo(()=>{
+    const set = new Set<string>()
+    addresses.forEach(a=> set.add(a.category))
+    return Array.from(set)
+  }, [addresses])
+
+  const filteredDocs = useMemo(()=>{
+    const list = currentCategoryFilter ? docs.filter(d=> d.category===currentCategoryFilter) : docs
+    // sort desc by uploadedAt
+    return [...list].sort((a,b)=> new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime())
+  }, [docs, currentCategoryFilter])
+
+  function toggleDoc(id:number){
+    setSelectedDocs(prev=>{ const p=new Set(prev); if(p.has(id)) p.delete(id); else p.add(id); return p })
+  }
+  function toggleCategory(key:string){
+    setSelectedCategories(prev=>{ const p=new Set(prev); if(p.has(key)) p.delete(key); else p.add(key); return p })
+  }
+  function clearSelections(){ setSelectedDocs(new Set()); setSelectedCategories(new Set()) }
+
+  async function createShare({password, days=30}:{password?:string, days?:number}){
+    if(selectedDocs.size===0 && selectedCategories.size===0){ alert('Selectează cel puțin un document sau o categorie.'); return }
+    if(mode==='online'){
+      // Try API first; fallback to offline
+      const body = { doc_ids: [...selectedDocs], categories: [...selectedCategories], password, expires_in_days: days }
+      const res = await safeFetch(`${apiUrl}/shares`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+      if(res && res.ok){
+        const s = await res.json() as ShareLink
+        setShares(prev=>[s, ...prev])
+        clearSelections()
+        setActive('partajare')
+        return
+      }
+    }
+    // Offline fallback
+    const id = randomId()
+    const url = `${window.location.origin}/s/${id}`
+    const expiresAt = addDays(new Date(), days).toISOString()
+    const s: ShareLink = { id, items:{ docs:[...selectedDocs], categories:[...selectedCategories] }, url, expiresAt, password }
+    setShares(prev=>[s, ...prev])
+    clearSelections()
+    setActive('partajare')
+  }
+
+  async function revokeShare(id:string){
+    if(mode==='online'){
+      const res = await safeFetch(`${apiUrl}/shares/${id}`, { method:'DELETE' })
+      if(res && res.ok){ setShares(prev=> prev.filter(x=>x.id!==id)); return }
+    }
+    setShares(prev=> prev.filter(x=>x.id!==id))
+  }
+
+  return (
+    <div className="app">
+      <style dangerouslySetInnerHTML={{__html: THEME_CSS}} />
+      <div style={{display:'flex'}}>
+        <Sidebar active={active} onSelect={setActive} mode={mode} />
+
+        <main style={{flex:1, padding:24}}>
+          <header className="header">
+            <h1 style={{fontSize:28, fontWeight:800, color:'var(--primary)'}}>Docs Ilegal — Preview</h1>
+            <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+              <ModeBadge mode={mode} />
+              {offlineStrict && <span className="badge" style={{background:'#EEF2FF', color:'#3730A3', border:'1px solid #C7D2FE'}}>Offline Strict</span>}
+              {error && <span className="badge" style={{background:'#FFF7ED', color:'var(--warning)', border:'1px solid #FED7AA'}}>{error}</span>}
+            </div>
+          </header>
+
+          {/* Selection bar */}
+          {(selectedDocs.size>0 || selectedCategories.size>0) && (
+            <div className="card" style={{display:'flex', alignItems:'center', justifyContent:'space-between', gap:12}}>
+              <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+                <span className="chip">{selectedDocs.size} doc</span>
+                <span className="chip">{selectedCategories.size} categorii</span>
+                {currentCategoryFilter && <span className="chip">Filtru: {currentCategoryFilter}</span>}
+                <span className="muted">Selectează și apoi creează un link în tab-ul „Partajare”.</span>
+              </div>
+              <div style={{display:'flex', gap:8}}>
+                <button className="btn" onClick={()=>setActive('partajare')}>Partajează…</button>
+                <button className="btn" onClick={clearSelections}>Golește selecția</button>
+              </div>
+            </div>
+          )}
+
+          {/* Pages */}
+          {active==='dashboard' && (
+            <section className="grid grid-3">
+              <Card title="Stare conexiune">
+                <p><b>Mod:</b> {mode==='online'? 'Online (API conectat)' : 'Offline Demo'}</p>
+                <p className="muted">Folosește tab-ul <b>Setări</b> pentru a testa conexiunea la API.</p>
+              </Card>
+              <Card title="Documente">
+                <p><b>Total</b>: {docs.length}</p>
+                <p className="muted">În Offline Demo, documentele sunt simulate.</p>
+              </Card>
+              <Card title="Categorii">
+                <p><b>{categories.length}</b> active</p>
+                <ul style={{marginTop:4, paddingLeft:16}}>
+                  {categories.map(c=> <li key={c}>{c}</li>)}
+                </ul>
+              </Card>
+              <WizardCard
+                apiUrl={apiUrl}
+                mode={mode}
+                hasDocs={docs.length>0}
+                onGoSetari={()=>setActive('setari')}
+                onCheck={checkConnection}
+                onGoUpload={()=>setActive('documente')}
+              />
+            </section>
+          )}
+
+          {active==='documente' && (
+            <div className="grid grid-2">
+              <section className="card">
+                <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+                  <div style={{display:'flex', alignItems:'center', gap:8}}>
+                    {currentCategoryFilter && (
+                      <button className="btn" onClick={()=>setActive('categorii')}>← Înapoi</button>
+                    )}
+                    <h2 style={{fontSize:20, fontWeight:700}}>Documente</h2>
+                  </div>
+                  <div style={{display:'flex', gap:8, alignItems:'center'}}>
+                    {currentCategoryFilter && <span className="chip">{currentCategoryFilter}</span>}
+                    {currentCategoryFilter && <button className="btn" onClick={()=>setCurrentCategoryFilter(undefined)}>Șterge filtru</button>}
+                  </div>
+                </div>
+                {filteredDocs.length===0 ? (
+                  <EmptyState title="Niciun document" actionLabel="Mergi la Upload" onAction={()=>setActive('documente')}>
+                    Încarcă primul document sau schimbă filtrul.
+                  </EmptyState>
+                ) : (
+                  <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(3, minmax(0,1fr))'}}>
+                    {filteredDocs.map(d => (
+                      <DocCard key={d.id}
+                        doc={d}
+                        checked={selectedDocs.has(d.id)}
+                        onToggle={()=>toggleDoc(d.id)}
+                        onPreview={()=>setPreviewDoc(d)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <section className="card">
+                <Uploader
+                  mode={mode}
+                  apiUrl={apiUrl}
+                  offlineStrict={offlineStrict}
+                  onUploaded={async(newDoc)=>{
+                    if(mode==='offline'){
+                      if(offlineStrict){ return } // blocked
+                      const id = ++idSeq.current
+                      setDocs(prev=>[{...newDoc, id}, ...prev])
+                    } else {
+                      await checkConnection()
+                    }
+                  }}
+                />
+                <EmptyHint show={mode==='offline'}>
+                  {offlineStrict
+                    ? 'Offline Strict activ: upload-ul este dezactivat până te conectezi la API.'
+                    : 'În Offline Demo, upload-ul este simulat local doar pentru previzualizare.'}
+                </EmptyHint>
+              </section>
+            </div>
+          )}
+
+          {active==='categorii' && (
+            <section className="card">
+              <h2 style={{fontSize:20, fontWeight:700}}>Categorii</h2>
+              <p className="muted">Click pe o categorie pentru a deschide lista de documente filtrată. Bifează caseta pentru a selecta categoria la partajare.</p>
+              <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(2, minmax(0,1fr))'}}>
+                {addresses.length===0
+                  ? <EmptyState title="Nicio categorie" actionLabel="Reîncarcă" onAction={()=>checkConnection()}>
+                      Nu s-au găsit categorii. Verifică API-ul sau folosește modul demo.
+                    </EmptyState>
+                  : addresses.map(a=> (
+                      <div key={a.category} className="card" style={{padding:12, cursor:'pointer'}} onClick={()=>{ setCurrentCategoryFilter(a.category); setActive('documente') }}>
+                        <div style={{display:'flex', gap:10, alignItems:'flex-start'}}>
+                          <input type="checkbox" checked={selectedCategories.has(a.category)} onClick={e=>e.stopPropagation()} onChange={()=>toggleCategory(a.category)} />
+                          <div>
+                            <div className="muted">cheie</div>
+                            <div style={{fontWeight:600, fontSize:16}}>{a.category}</div>
+                            <div className="muted" style={{marginTop:6}}>{a.address}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+              </div>
+            </section>
+          )}
+
+          {active==='cautare' && (
+            <section className="card">
+              <SearchPane docs={docs} onToggle={toggleDoc} isChecked={(id)=>selectedDocs.has(id)} onPreview={(d)=>setPreviewDoc(d)} />
+            </section>
+          )}
+
+          {active==='partajare' && (
+            <section className="card">
+              <h2 style={{fontSize:20, fontWeight:700}}>Partajare</h2>
+              <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap', marginTop:8}}>
+                <span className="chip">{selectedDocs.size} doc</span>
+                <span className="chip">{selectedCategories.size} categorii</span>
+              </div>
+              <ShareForm
+                mode={mode}
+                apiUrl={apiUrl}
+                createShare={createShare}
+                canCreate={selectedDocs.size>0 || selectedCategories.size>0}
+              />
+              <div className="divider" />
+              <ShareList shares={shares} onRevoke={revokeShare} />
+            </section>
+          )}
+
+          {active==='inbox' && (
+            <section className="card">
+              <MagicInbox
+                mode={mode}
+                apiUrl={apiUrl}
+                offlineStrict={offlineStrict}
+                addresses={addresses}
+                onAddresses={setAddresses}
+                onChanged={async()=>{ if(mode==='online') await checkConnection() }}
+              />
+              <EmptyHint show={mode==='offline'}>
+                {offlineStrict
+                  ? 'Offline Strict activ: rotirea controlului este dezactivată până te conectezi la API.'
+                  : 'În Offline Demo, rotirea controlului este simulată doar pentru previzualizare.'}
+              </EmptyHint>
+            </section>
+          )}
+
+          {active==='setari' && (
+            <section className="card" style={{display:'grid', gap:16}}>
+              <h2 style={{fontSize:20, fontWeight:700}}>Setări</h2>
+              <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+                <span className="muted">API URL</span>
+                <input className="input" value={apiUrl} onChange={e=>setApiUrl(e.target.value)} placeholder="ex: https://docs-ilegal-api-xxxx.a.run.app" />
+                <button className="btn btn-primary" onClick={checkConnection} disabled={busy}>{busy? '...' : 'Check connection'}</button>
+                <button className="btn" onClick={()=>{ setMode('offline'); setError('Forțat Offline Demo Mode.'); }}>Forțează Offline</button>
+              </div>
+
+              <label style={{display:'flex', gap:8, alignItems:'center'}}>
+                <input id="offlineStrict" type="checkbox" checked={offlineStrict} onChange={e=>setOfflineStrict(e.target.checked)} />
+                <span className="muted">Offline Strict — blochează acțiunile de scriere când ești offline (upload, rotire control)</span>
+              </label>
+
+              {error && <div className="card" style={{background:'#FFF7ED', borderColor:'#FED7AA', color:'var(--warning)'}}>{error}</div>}
+              <p className="muted">Recomandat: păstrează UI-ul funcțional în modul demo; activează <b>Offline Strict</b> doar când vrei interacțiune strict read-only.</p>
+            </section>
+          )}
+
+          <TestPanel
+            mode={mode}
+            offlineStrict={offlineStrict}
+            setOfflineStrict={setOfflineStrict}
+            addresses={addresses}
+            docs={docs}
+            setAddresses={setAddresses}
+            setDocs={setDocs}
+            active={active}
+            setActive={setActive}
+            currentCategoryFilter={currentCategoryFilter}
+            setCurrentCategoryFilter={setCurrentCategoryFilter}
+            shares={shares}
+            setShares={setShares}
+            createShare={createShare}
+          />
+
+          <footer className="muted" style={{marginTop:12}}>MVP preview. Conectează un API real pentru flux complet.</footer>
+        </main>
+      </div>
+
+      {/* Preview Modal */}
+      {previewDoc && (
+        <div className="overlay" onClick={()=>setPreviewDoc(null)}>
+          <div className="card modal" onClick={e=>e.stopPropagation()}>
+            <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+              <div>
+                <div style={{fontWeight:700, fontSize:18}}>{previewDoc.name}</div>
+                <div className="muted">{previewDoc.filename}</div>
+              </div>
+              <button className="btn" onClick={()=>setPreviewDoc(null)}>Închide</button>
+            </div>
+            <div className="divider" />
+            {previewDoc.url
+              ? <iframe src={previewDoc.url} style={{width:'100%', height:'65vh', border:'1px solid var(--border)', borderRadius:12}} title="Preview document" />
+              : <div className="card" style={{textAlign:'center'}}>Mock preview indisponibil fără un URL real. În modul online se încarcă viewer-ul.</div>
+            }
+            <div className="divider" />
+            <div className="muted">Încărcat: {fmtDate(previewDoc.uploadedAt)} • Expiră: {fmtDate(previewDoc.expiresAt)}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Sidebar({active, onSelect, mode}:{active:Tab, onSelect:(t:Tab)=>void, mode:Mode}){
+  const items: {key:Tab,label:string}[] = [
+    {key:'dashboard', label:'Dashboard'},
+    {key:'documente', label:'Documente'},
+    {key:'categorii', label:'Categorii'},
+    {key:'cautare', label:'Căutare AI'},
+    {key:'partajare', label:'Partajare'},
+    {key:'inbox', label:'Magic Inbox'},
+    {key:'setari', label:'Setări'},
+  ]
+  return (
+    <aside className="sidebar" style={{minHeight:'100vh', padding:16, display:'flex', flexDirection:'column', gap:16}}>
+      <div className="brand">Docs Ilegal</div>
+      <div className="muted" style={{color:'#C7D2E5'}}>Stare: <ModeBadge mode={mode} /></div>
+      <nav style={{display:'grid', gap:6}}>
+        {items.map(it => (
+          <button
+            key={it.key}
+            onClick={()=>onSelect(it.key)}
+            className={active===it.key? 'active' : ''}
+          >{it.label}</button>
+        ))}
+      </nav>
+    </aside>
+  )
+}
+
+function Card({title, children}:{title:string, children:React.ReactNode}){
+  return (
+    <div className="card">
+      <h3 style={{fontWeight:700, marginBottom:8}}>{title}</h3>
+      {children}
+    </div>
+  )
+}
+
+function EmptyState({title, children, actionLabel, onAction}:{title:string, children:React.ReactNode, actionLabel?:string, onAction?:()=>void}){
+  return (
+    <div className="card" style={{borderStyle:'dashed', textAlign:'center'}}>
+      <div style={{fontWeight:600, marginBottom:6}}>{title}</div>
+      <div className="muted" style={{marginBottom:10}}>{children}</div>
+      {actionLabel && onAction && (
+        <button className="btn" onClick={onAction}>{actionLabel}</button>
+      )}
+    </div>
+  )
+}
+
+function EmptyHint({show, children}:{show:boolean, children:React.ReactNode}){
+  if(!show) return null
+  return <div className="muted" style={{marginTop:8}}>{children}</div>
+}
+
+function ModeBadge({mode}:{mode:Mode}){
+  const cls = mode==='online'? 'badge badge-online' : 'badge badge-offline'
+  const label = mode==='online'? 'Online' : 'Offline Demo'
+  return <span className={cls}>{label}</span>
+}
+
+function WizardCard({apiUrl, mode, hasDocs, onGoSetari, onCheck, onGoUpload}:{apiUrl:string, mode:Mode, hasDocs:boolean, onGoSetari:()=>void, onCheck:()=>void, onGoUpload:()=>void}){
+  const step1 = !!apiUrl
+  const step2 = mode==='online'
+  const step3 = hasDocs
+  return (
+    <Card title="Setup Wizard">
+      <ol style={{paddingLeft:18, display:'grid', gap:8}}>
+        <li>
+          <div>
+            Setează <b>API URL</b> în Setări {step1? '✅' : '⬜'}
+            {!step1 && <div><button className="btn" onClick={onGoSetari}>Mergi la Setări</button></div>}
+          </div>
+        </li>
+        <li>
+          <div>
+            Apasă <b>Check connection</b> {step2? '✅' : '⬜'}
+            {!step2 && <div><button className="btn btn-primary" onClick={onCheck}>Check connection</button></div>}
+          </div>
+        </li>
+        <li>
+          <div>
+            Încarcă primul document {step3? '✅' : '⬜'}
+            {!step3 && <div><button className="btn" onClick={onGoUpload}>Mergi la Upload</button></div>}
+          </div>
+        </li>
+      </ol>
+    </Card>
+  )
+}
+
+function MagicInbox({mode, apiUrl, offlineStrict, addresses, onAddresses, onChanged}:{mode:Mode, apiUrl:string, offlineStrict:boolean, addresses:Address[], onAddresses:(a:Address[])=>void, onChanged:()=>void}){
+  const [control, setControl] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function rotateOffline(){
+    if(!control || offlineStrict) return
+    const newAddrs = addresses.map(a => {
+      const [cat, , userAt] = a.address.split('.')
+      const user = userAt.split('@')[0]
+      return { category: a.category, address: makeAddress(cat, control, user) }
+    })
+    onAddresses(newAddrs)
+  }
+
+  async function rotateOnline(){
+    if(!control) return
+    const res = await safeFetch(`${apiUrl}/me/magic-inbox/control`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({control})
+    })
+    if(!res || !res.ok) throw new Error('Eroare la API /me/magic-inbox/control')
+  }
+
+  const rotate = async ()=>{
+    setBusy(true)
+    try{
+      if(mode==='offline') await rotateOffline(); else await rotateOnline()
+      setControl('')
+      onChanged()
+    } catch(e:any){
+      alert(e?.message || 'Rotirea a eșuat')
+    } finally { setBusy(false) }
+  }
+
+  const disabled = busy || (mode==='offline' && offlineStrict) || !control
+
+  return (
+    <div>
+      <h2 style={{fontSize:20, fontWeight:700}}>Magic Inbox</h2>
+      <p className="muted">Adrese per categorie, derivate din <code>[categorie].[control].[user]@docs.ilegal.ro</code>. Poți roti <code>control</code> (1–5 caractere).</p>
+      <div style={{display:'flex', gap:8, alignItems:'center', marginTop:8}}>
+        <input className="input" placeholder="control (1–5)" value={control} onChange={e=>setControl(e.target.value)} disabled={mode==='offline' && offlineStrict} />
+        <button className="btn btn-primary" onClick={rotate} disabled={disabled}>{busy? '...' : 'Rotește adresele'}</button>
+      </div>
+      <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(2, minmax(0,1fr))', marginTop:12}}>
+        {addresses.length===0
+          ? <div className="muted">Nu există adrese. Verifică API-ul sau folosește modul demo.</div>
+          : addresses.map(a => (
+              <div key={a.category} className="card" style={{padding:12}}>
+                <div className="muted">categorie</div>
+                <div style={{fontWeight:600}}>{a.category}</div>
+                <div className="muted" style={{marginTop:6}}>{a.address}</div>
+              </div>
+            ))}
+      </div>
+    </div>
+  )}
+
+function Uploader({mode, apiUrl, offlineStrict, onUploaded}:{mode:Mode, apiUrl:string, offlineStrict:boolean, onUploaded:(newDoc: Omit<Doc,'id'>)=>void|Promise<void>}){
+  const [file, setFile] = useState<File|null>(null)
+  const [category, setCategory] = useState('facturi')
+  const [name, setName] = useState('')
+  const [expiresIn, setExpiresIn] = useState(365) // zile
+  const [busy, setBusy] = useState(false)
+
+  useEffect(()=>{
+    if(file){
+      const base = file.name.replace(/\.[^.]+$/, '')
+      setName(prev=> prev || base)
+    }
+  }, [file])
+
+  async function uploadOffline(){
+    if(!file || offlineStrict) return
+    const now = new Date()
+    const doc: Omit<Doc,'id'> = {
+      name: name || file.name.replace(/\.[^.]+$/, ''),
+      filename: file.name,
+      category,
+      uploadedAt: now.toISOString(),
+      expiresAt: addDays(now, Math.max(1, Number(expiresIn)||365)).toISOString(),
+      url: undefined,
+    }
+    await onUploaded(doc)
+  }
+
+  async function uploadOnline(){
+    if(!file) return
+    const fd = new FormData()
+    fd.append('category', category)
+    fd.append('file', file)
+    // Optional metadata (dacă backend-ul permite):
+    fd.append('name', name || file.name.replace(/\.[^.]+$/, ''))
+    fd.append('expires_in_days', String(Math.max(1, Number(expiresIn)||365)))
+    const res = await safeFetch(`${apiUrl}/documents/upload`, { method:'POST', body: fd })
+    if(!res || !res.ok) throw new Error('Upload eșuat (API)')
+    // Fallback local în caz că API-ul nu întoarce payload-ul actualizat imediat
+    const now = new Date()
+    await onUploaded({ name: name || file.name.replace(/\.[^.]+$/, ''), filename: file.name, category, uploadedAt: now.toISOString(), expiresAt: addDays(now, Math.max(1, Number(expiresIn)||365)).toISOString() })
+  }
+
+  const submit = async ()=>{
+    if(!file) return
+    setBusy(true)
+    try{
+      if(mode==='offline') await uploadOffline(); else await uploadOnline()
+    } catch(e:any){
+      alert(e?.message || 'Upload eșuat')
+    } finally { setBusy(false) }
+  }
+
+  const disabled = busy || (mode==='offline' && offlineStrict) || !file
+
+  return (
+    <div>
+      <h2 style={{fontSize:20, fontWeight:700}}>Upload documente</h2>
+      <div style={{display:'grid', gap:8, alignItems:'center', marginTop:8}}>
+        <label className="muted">Categorie</label>
+        <select className="input" value={category} onChange={e=>setCategory(e.target.value)}>
+          <option value="facturi">facturi</option>
+          <option value="contracte">contracte</option>
+          <option value="hr">hr</option>
+          <option value="ssm">ssm</option>
+        </select>
+        <label className="muted">Fișier</label>
+        <input className="input" type="file" onChange={e=>setFile(e.target.files?.[0] ?? null)} />
+        <label className="muted">Nume document</label>
+        <input className="input" placeholder="ex: Contract de muncă" value={name} onChange={e=>setName(e.target.value)} />
+        <label className="muted">Expiră în (zile)</label>
+        <input className="input" type="number" min={1} max={3650} value={expiresIn} onChange={e=>setExpiresIn(parseInt(e.target.value||'365',10))} style={{width:160}} />
+        <button className="btn btn-primary" onClick={submit} disabled={disabled}>{busy? 'Se încarcă…' : 'Încarcă'}</button>
+      </div>
+      {mode==='offline' && offlineStrict && (
+        <div className="muted" style={{marginTop:8}}>Offline Strict activ: încărcarea este dezactivată până la conectarea la API.</div>
+      )}
+    </div>
+  )
+}
+
+function Thumb({filename}:{filename:string}){
+  const ext = (filename.split('.').pop() || '').toUpperCase()
+  return <div className="thumb">{ext || 'DOC'}</div>
+}
+
+function DocCard({doc, checked, onToggle, onPreview}:{doc:Doc, checked:boolean, onToggle:()=>void, onPreview:()=>void}){
+  const expired = doc.expiresAt ? new Date(doc.expiresAt).getTime() < Date.now() : false
+  return (
+    <div className="card" style={{padding:12, display:'flex', gap:12}}>
+      <Thumb filename={doc.filename} />
+      <div style={{flex:1}}>
+        <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start'}}>
+          <label style={{display:'flex', gap:8, alignItems:'center'}}>
+            <input type="checkbox" checked={checked} onChange={onToggle} />
+            <div>
+              <div style={{fontWeight:700}}>{doc.name}</div>
+              <div className="muted" style={{fontFamily:'ui-monospace,Menlo,Consolas'}}> {doc.filename} </div>
+            </div>
+          </label>
+          <div style={{display:'flex', gap:8, alignItems:'center'}}>
+            {doc.url && <a className="btn" href={doc.url} target="_blank" rel="noreferrer">Descarcă</a>}
+            <button className="btn" onClick={onPreview}>Preview</button>
+          </div>
+        </div>
+        <div className="muted" style={{marginTop:6}}>Încărcat: {fmtDate(doc.uploadedAt)} • Expiră: {fmtDate(doc.expiresAt)} {expired && <span className="badge" style={{background:'#FEF2F2', color:'var(--danger)', border:'1px solid #FCA5A5', marginLeft:6}}>expirat</span>}</div>
+        <div className="muted" style={{marginTop:6}}>Categorie: {doc.category}</div>
+      </div>
+    </div>
+  )
+}
+
+function SearchPane({docs, onToggle, isChecked, onPreview}:{docs:Doc[], onToggle:(id:number)=>void, isChecked:(id:number)=>boolean, onPreview:(d:Doc)=>void}){
+  // Lightweight local search: filename + category + name contains query (case-insensitive)
+  const [q, setQ] = useState('')
+  const filtered = useMemo(()=>{
+    const t = q.trim().toLowerCase()
+    if(!t) return [] as Doc[]
+    return docs.filter(d => (d.name+" "+d.filename+" "+d.category).toLowerCase().includes(t)).slice(0, 10)
+  }, [q, docs])
+  return (
+    <div>
+      <h2 style={{fontSize:20, fontWeight:700}}>Căutare AI (local demo)</h2>
+      <p className="muted">Offline: filtrare simplă. În proiectul descărcabil poți activa Lunr.js + OCR.</p>
+      <input className="input" placeholder="Ex: contract HR" value={q} onChange={e=>setQ(e.target.value)} />
+      {!q && <div className="muted" style={{marginTop:8}}>Sugestie: caută „contract” sau „facturi”.</div>}
+      {q && (
+        <div style={{marginTop:12, display:'grid', gap:12}}>
+          {filtered.map(d => (
+            <DocCard key={d.id}
+              doc={d}
+              checked={isChecked(d.id)}
+              onToggle={()=>onToggle(d.id)}
+              onPreview={()=>onPreview(d)}
+            />
+          ))}
+          {filtered.length===0 && <div className="muted">Nimic găsit.</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// === Sharing UI ===
+function ShareForm({mode, apiUrl, createShare, canCreate}:{mode:Mode, apiUrl:string, createShare:(o:{password?:string, days?:number})=>Promise<void>, canCreate:boolean}){
+  const [password, setPassword] = useState('')
+  const [days, setDays] = useState(30)
+  return (
+    <div className="card" style={{marginTop:12}}>
+      <div style={{display:'grid', gap:12}}>
+        <div className="muted">Creează un link de partajare (implicit 30 zile). Parola este opțională.</div>
+        <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+          <label className="muted">Parolă (opțional)</label>
+          <input className="input" placeholder="ex: 4-12 caractere" value={password} onChange={e=>setPassword(e.target.value)} />
+          <label className="muted">Valabilitate (zile)</label>
+          <input className="input" type="number" min={1} max={365} value={days} onChange={e=>setDays(parseInt(e.target.value || '30',10))} style={{width:100}} />
+          <button className="btn btn-primary" onClick={()=>createShare({password: password || undefined, days})} disabled={!canCreate}>Creează link</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ShareList({shares, onRevoke}:{shares:ShareLink[], onRevoke:(id:string)=>void}){
+  if(shares.length===0) return <EmptyState title="Niciun link partajat" actionLabel={undefined}>Creează un link de partajare folosind selecția curentă.</EmptyState>
+  return (
+    <div style={{marginTop:12}}>
+      <table className="table">
+        <thead>
+          <tr><th>Link</th><th>Expiră</th><th>Elemente</th><th>Parolă</th><th></th></tr>
+        </thead>
+        <tbody>
+          {shares.map(s=>{
+            const expired = new Date(s.expiresAt).getTime() < Date.now()
+            return (
+              <tr key={s.id}>
+                <td>
+                  <a href={s.url} target="_blank" rel="noreferrer" style={{color:'var(--accent)'}}>{s.url}</a>
+                  <button className="btn" style={{marginLeft:8}} onClick={()=>navigator.clipboard?.writeText(s.url)}>Copy</button>
+                </td>
+                <td>{fmtDate(s.expiresAt)} {expired && <span className="badge" style={{background:'#FEF2F2', color:'var(--danger)', border:'1px solid #FCA5A5'}}>expirat</span>}</td>
+                <td>{s.items.docs.length} doc / {s.items.categories.length} cat</td>
+                <td>{s.password? '✔︎' : '—'}</td>
+                <td style={{textAlign:'right'}}><button className="btn btn-danger" onClick={()=>onRevoke(s.id)}>Revocă</button></td>
+              </tr>
+            )})}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function TestPanel({ mode, offlineStrict, setOfflineStrict, addresses, docs, setAddresses, setDocs, active, setActive, currentCategoryFilter, setCurrentCategoryFilter, shares, setShares, createShare }){
+  const [log, setLog] = useState([])
+  const add = (s)=> setLog(p=>[...p,s])
+  async function run(){
+    setLog([])
+    try{
+      add(addresses.length? '✅T1' : '❌T1')
+      const found = docs.some(d=>/contract/i.test(d.filename+d.name)); add(found? '✅T2':'❌T2')
+      if(mode==='offline'){
+        const a0=addresses[0]?.address; const na=addresses.map(a=>({...a,address:a.address.replace(`.${DEMO_INITIAL_CONTROL}.`,'.9.')})); setAddresses(na)
+        const a1=na[0]?.address; add(a0&&a1&&a0!==a1&&/\.9\./.test(a1)?'✅T3':'❌T3')
+      } else add('ℹ️T3')
+      const c0=addresses[0]?.category; setCurrentCategoryFilter(c0); setActive('documente'); add(c0? '✅T4':'❌T4')
+      const ok=!!(docs[0]?.uploadedAt&&docs[0]?.expiresAt); add(ok?'✅T5':'❌T5')
+      const n=shares.length; await createShare({days:30}); add(n<=shares.length? '✅T6':'❌T6')
+      const ps=offlineStrict; setOfflineStrict(!ps); add('✅T7')
+    }catch(e){ add('❌E') }
+  }
+  return (
+    <section className="card" style={{marginTop:16}}>
+      <h2 style={{fontSize:18,fontWeight:700}}>Teste</h2>
+      <button className="btn" onClick={run} style={{marginTop:8}}>Rulează</button>
+      {log.length>0 && (<ul style={{marginTop:12}} className="muted">{log.map((l,i)=>(<li key={i}>{l}</li>))}</ul>)}
+    </section>
+  )
+}
+
+
+// ===== Public Share Page (read-only) + tiny router =====
+function getShareIdFromPath(): string | null {
+  const m = window.location.pathname.match(/^\/s\/([a-zA-Z0-9_-]+)/)
+  return m ? m[1] : null
+}
+function getQueryParam(name: string): string | null {
+  const u = new URL(window.location.href)
+  return u.searchParams.get(name)
+}
+
+function PublicShareView(){
+  const [apiUrl, setApiUrl] = useState<string>('')
+  const [password, setPassword] = useState<string>('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string>('')
+  const [docs, setDocs] = useState<Doc[]>([])
+  const id = getShareIdFromPath()
+
+  useEffect(()=>{
+    const fromQuery = getQueryParam('api') || ''
+    const fromLS = (typeof window!=='undefined') ? localStorage.getItem('apiUrl') || '' : ''
+    const initial = fromQuery || fromLS
+    setApiUrl(initial)
+    if(initial && id){ void fetchShare(initial, id, '') }
+    // eslint-disable-next-line
+  }, [])
+
+  async function fetchShare(api: string, shareId: string, pass: string){
+    setLoading(true); setError('')
+    try{
+      const url = new URL(`${api.replace(/\/+$/,'')}/shares/${shareId}`)
+      if(pass) url.searchParams.set('password', pass)
+      const res = await safeFetch(url.toString())
+      if(!res) throw new Error('Conexiune eșuată')
+      if(res.status === 401){ setError('Acest link necesită parolă.'); setDocs([]); return }
+      if(res.status === 410){ setError('Link expirat.'); setDocs([]); return }
+      if(!res.ok){ const t = await res.text(); throw new Error(`Eroare API (${res.status}): ${t}`) }
+      const data = await res.json()
+      setDocs(Array.isArray(data?.docs) ? data.docs : [])
+      setError('')
+      if(typeof window!=='undefined') localStorage.setItem('apiUrl', api)
+    }catch(e:any){ setError(e?.message || 'Eroare necunoscută'); setDocs([]) }
+    finally{ setLoading(false) }
+  }
+
+  if(!id){
+    return (
+      <div className="app">
+        <style dangerouslySetInnerHTML={{__html: THEME_CSS}} />
+        <main style={{maxWidth:800, margin:'40px auto', padding:16}}>
+          <div className="card"><h2>ID de partajare invalid.</h2></div>
+        </main>
+      </div>
+    )
+  }
+
+  return (
+    <div className="app">
+      <style dangerouslySetInnerHTML={{__html: THEME_CSS}} />
+      <main style={{maxWidth:940, margin:'24px auto', padding:16}}>
+        <div className="card" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+          <div>
+            <h1 style={{margin:0}}>Fișiere partajate</h1>
+            <div className="muted">Share ID: <code>{id}</code></div>
+          </div>
+          <a className="btn" href="/" rel="noreferrer">Deschide panoul</a>
+        </div>
+
+        <section className="card" style={{marginTop:12, display:'grid', gap:10}}>
+          <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+            <label className="muted">API URL</label>
+            <input className="input" placeholder="https://docs-ilegal-api-....a.run.app" value={apiUrl} onChange={e=>setApiUrl(e.target.value)} />
+            <label className="muted">Parolă (dacă e necesară)</label>
+            <input className="input" type="password" placeholder="••••" value={password} onChange={e=>setPassword(e.target.value)} />
+            <button className="btn btn-primary" disabled={!apiUrl || !id || loading} onClick={()=>fetchShare(apiUrl, id, password)}>{loading? '...' : 'Accesează'}</button>
+          </div>
+          {error && <div className="card" style={{background:'#FFF7ED', borderColor:'#FED7AA'}}>{error}</div>}
+        </section>
+
+        <section className="card" style={{marginTop:12}}>
+          {docs.length===0 ? (
+            <div className="muted">Niciun fișier disponibil sau lipsește parola corectă.</div>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr><th>Nume</th><th>Fișier</th><th>Categorie</th><th>Încărcat</th><th>Acțiuni</th></tr>
+              </thead>
+              <tbody>
+                {docs.map(d=>{
+                  const canOpen = !!d.url
+                  return (
+                    <tr key={d.id}>
+                      <td>{d.name}</td>
+                      <td className="muted">{d.filename}</td>
+                      <td>{d.category}</td>
+                      <td className="muted">{fmtDate(d.uploadedAt)}</td>
+                      <td>
+                        {canOpen
+                          ? <a className="btn" href={d.url!} target="_blank" rel="noreferrer">Descarcă</a>
+                          : <span className="muted">fără link public</span>}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </section>
+      </main>
+    </div>
+  )
+}
+
+// Router minim: dacă path-ul începe cu /s/, redăm pagina publică; altfel UI-ul de administrare
+export default function App(){
+  return window.location.pathname.startsWith('/s/')
+    ? <PublicShareView />
+    : <PreviewApp />
+}
