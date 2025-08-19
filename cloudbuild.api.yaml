@@ -1,0 +1,18 @@
+steps:
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  entrypoint: bash
+  env:
+  - REGION=${_REGION}
+  - BUCKET=${_BUCKET}
+  args:
+  - -c
+  - |
+    gcloud run deploy docs-ilegal-api \
+      --source ./api \
+      --region "$REGION" \
+      --allow-unauthenticated \
+      --update-env-vars BUCKET_NAME="$BUCKET"
+substitutions:
+  _REGION: europe-west1
+  _BUCKET: your-bucket-name-here
+timeout: "1200s"

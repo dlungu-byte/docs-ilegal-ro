@@ -1,0 +1,15 @@
+steps:
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  entrypoint: bash
+  env:
+  - REGION=${_REGION}
+  args:
+  - -c
+  - |
+    gcloud run deploy docs-ilegal-web \
+      --source ./frontend \
+      --region "$REGION" \
+      --allow-unauthenticated
+substitutions:
+  _REGION: europe-west1
+timeout: "1200s"
